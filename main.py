@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from supabase import create_client
 from dotenv import load_dotenv
 from urllib.parse import urlencode
-
+from datetime import datetime, timedelta
 load_dotenv()
 
 app = FastAPI()
@@ -18,14 +18,13 @@ app = FastAPI()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
+ZOHO_REDIRECT_URI = os.getenv("ZOHO_REDIRECT_URI")
+
 ZOHO_ACCOUNTS_URL = "https://accounts.zoho.in"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# =========================
-# TEMP SESSION STORE
-# =========================
-user_sessions = {}
 
 # =========================
 # HOME
@@ -39,7 +38,7 @@ def home():
     """
 
 # =========================
-# SIGNUP
+# AUTH
 # =========================
 @app.get("/signup", response_class=HTMLResponse)
 def signup_page():
@@ -54,16 +53,9 @@ def signup_page():
 
 @app.post("/signup")
 def signup(email: str = Form(...), password: str = Form(...)):
-    res = supabase.auth.sign_up({
-        "email": email,
-        "password": password
-    })
-
+    supabase.auth.sign_up({"email": email, "password": password})
     return RedirectResponse(url="/signin", status_code=302)
 
-# =========================
-# SIGNIN
-# =========================
 @app.get("/signin", response_class=HTMLResponse)
 def signin_page():
     return """
@@ -82,207 +74,208 @@ def signin(email: str = Form(...), password: str = Form(...)):
         "password": password
     })
 
-    user_id = res.user.id
-    return RedirectResponse(url=f"/zoho-setup?user_id={user_id}", status_code=302)
+    return RedirectResponse(url=f"/zoho-connect?user_id={res.user.id}", status_code=302)
 
 # =========================
-# ZOHO SETUP
+# ZOHO CONNECT
 # =========================
-@app.get("/zoho-setup", response_class=HTMLResponse)
-def zoho_setup(user_id: str):
+@app.get("/zoho-connect", response_class=HTMLResponse)
+def zoho_connect_page(user_id: str):
     return f"""
-    <h2>Zoho Setup</h2>
-    <form action="/zoho-setup" method="post">
-        <input type="hidden" name="user_id" value="{user_id}">
-        Client ID: <input name="client_id"><br><br>
-        Client Secret: <input name="client_secret"><br><br>
-        Redirect URI: <input name="redirect_uri" value="http://localhost:8000/callback"><br><br>
-        <button type="submit">Connect Zoho</button>
-    </form>
+    <h2>Connect Zoho</h2>
+    <a href="/zoho-auth?user_id={user_id}">Connect Now</a>
     """
 
-@app.post("/zoho-setup")
-def zoho_setup_post(
-    user_id: str = Form(...),
-    client_id: str = Form(...),
-    client_secret: str = Form(...),
-    redirect_uri: str = Form(...)
-):
-    user_sessions[user_id] = {
-        "client_id": client_id.strip(),
-        "client_secret": client_secret.strip(),
-        "redirect_uri": redirect_uri.strip()
-    }
+@app.get("/zoho-auth")
+def zoho_auth(user_id: str):
 
-    # ✅ FIXED SCOPES
     params = {
         "scope": "ZohoCRM.settings.modules.ALL,ZohoCRM.settings.fields.ALL,ZohoCRM.modules.ALL",
-        "client_id": client_id,
+        "client_id": ZOHO_CLIENT_ID,
         "response_type": "code",
         "access_type": "offline",
-        "redirect_uri": redirect_uri,
+        "redirect_uri": ZOHO_REDIRECT_URI,
         "state": user_id
     }
 
-    auth_url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/auth?{urlencode(params)}"
-    return RedirectResponse(url=auth_url, status_code=302)
+    url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/auth?{urlencode(params)}"
+    return RedirectResponse(url=url)
 
 # =========================
 # CALLBACK
 # =========================
+
 @app.get("/callback")
 def callback(code: str, state: str):
-    user_id = state
-    creds = user_sessions.get(user_id)
 
     token_url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
 
     payload = {
         "grant_type": "authorization_code",
-        "client_id": creds["client_id"],
-        "client_secret": creds["client_secret"],
-        "redirect_uri": creds["redirect_uri"],
+        "client_id": ZOHO_CLIENT_ID,
+        "client_secret": ZOHO_CLIENT_SECRET,
+        "redirect_uri": ZOHO_REDIRECT_URI,
         "code": code
     }
 
     response = requests.post(token_url, params=payload)
     data = response.json()
 
-    access_token = data["access_token"]
-    refresh_token = data.get("refresh_token")
+    if "access_token" not in data:
+        return {"error": "Token failed", "details": data}
+
+    expires_in = data.get("expires_in", 3600)
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
     supabase.table("zoho_tokens").upsert({
-        "user_id": user_id,
-        "zoho_access_token": access_token,
-        "zoho_refresh_token": refresh_token
+        "user_id": state,
+        "zoho_access_token": data["access_token"],
+        "zoho_refresh_token": data.get("refresh_token"),
+        "expires_in": expires_in,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.utcnow().isoformat(),
+        "modified_at": datetime.utcnow().isoformat()
     }, on_conflict="user_id").execute()
 
-    return RedirectResponse(url=f"/dashboard?user_id={user_id}", status_code=302)
+    return RedirectResponse(url=f"/dashboard?user_id={state}", status_code=302)
 
+
+def get_valid_token(user_id):
+
+    res = supabase.table("zoho_tokens") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .execute()
+
+    if not res.data:
+        return None
+
+    token_data = res.data[0]
+
+    access_token = token_data.get("zoho_access_token")
+    refresh_token = token_data.get("zoho_refresh_token")
+    expires_at = token_data.get("expires_at")
+
+    # ✅ Safe expiry check
+    try:
+        if expires_at:
+            expires_at = datetime.fromisoformat(expires_at)
+
+            if datetime.utcnow() < expires_at:
+                return access_token
+    except Exception as e:
+        print("Expiry parse error:", e)
+
+    # 🔁 Refresh fallback
+    if refresh_token:
+        return refresh_access_token(refresh_token, user_id)
+
+    return access_token
+
+
+def refresh_access_token(refresh_token, user_id):
+
+    url = "https://accounts.zoho.in/oauth/v2/token"
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": ZOHO_CLIENT_ID,
+        "client_secret": ZOHO_CLIENT_SECRET,
+        "refresh_token": refresh_token
+    }
+
+    response = requests.post(url, params=payload)
+    data = response.json()
+
+    if "access_token" not in data:
+        print("REFRESH FAILED:", data)
+        return None
+
+    new_access_token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+    # 🔥 Update DB
+    supabase.table("zoho_tokens").update({
+        "zoho_access_token": new_access_token,
+        "expires_in": expires_in,
+        "expires_at": expires_at.isoformat(),
+        "modified_at": datetime.utcnow().isoformat()
+    }).eq("user_id", user_id).execute()
+
+    return new_access_token
 # =========================
-# 🔥 GET MODULES
+# HELPERS
 # =========================
-def get_zoho_modules(access_token):
+
+
+def get_modules(token):
     url = "https://www.zohoapis.in/crm/v2/settings/modules"
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    return requests.get(url, headers=headers).json().get("modules", [])
 
-    headers = {
-        "Authorization": f"Zoho-oauthtoken {access_token}"
-    }
-
-    response = requests.get(url, headers=headers)
-
-    print("MODULE STATUS:", response.status_code)
-    print("MODULE RESPONSE:", response.text)
-
-    data = response.json()
-
-    modules = []
-    for m in data.get("modules", []):
-        modules.append({
-            "api_name": m.get("api_name"),
-            "display_name": m.get("module_name")
-        })
-
-    return modules
-
-# =========================
-# 🔥 GET FIELDS
-# =========================
-def get_zoho_fields(access_token, module):
+def get_fields(token, module):
     url = f"https://www.zohoapis.in/crm/v2/settings/fields?module={module}"
-
-    headers = {
-        "Authorization": f"Zoho-oauthtoken {access_token}"
-    }
-
-    response = requests.get(url, headers=headers)
-
-    print("FIELDS RESPONSE:", response.text)
-
-    data = response.json()
-
-    fields = []
-    for f in data.get("fields", []):
-        fields.append({
-            "api_name": f.get("api_name"),
-            "display_label": f.get("field_label"),
-            "required": f.get("system_mandatory", False)
-        })
-
-    return fields
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    return requests.get(url, headers=headers).json().get("fields", [])
 
 # =========================
-# DASHBOARD (DYNAMIC MODULES)
+# DASHBOARD
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(user_id: str):
 
-    token_res = supabase.table("zoho_tokens") \
-        .select("*") \
-        .eq("user_id", user_id) \
-        .execute()
+    token = get_valid_token(user_id)
+    if not token:
+        return "Zoho not connected"
 
-    access_token = token_res.data[0]["zoho_access_token"]
+    modules = get_modules(token)
 
-    modules = get_zoho_modules(access_token)
-
-    options = ""
-    for m in modules:
-        options += f'<option value="{m["api_name"]}">{m["display_name"]}</option>'
+    options = "".join([
+        f'<option value="{m["api_name"]}">{m["module_name"]}</option>'
+        for m in modules if m.get("api_name")
+    ])
 
     return f"""
-    <h2>Zoho Connected ✅</h2>
-
-    <form action="/push-select" method="get">
+    <h2>Select Module</h2>
+    <form action="/push-select">
         <input type="hidden" name="user_id" value="{user_id}">
-
-        <label>Select Module:</label><br><br>
-        <select name="module">
-            {options}
-        </select><br><br>
-
-        <button type="submit">Continue</button>
-    </form>
-    """
-
-# =========================
-# FIELD MAPPING UI
-# =========================
-@app.get("/push-select", response_class=HTMLResponse)
-def push_select(user_id: str, module: str):
-
-    token_res = supabase.table("zoho_tokens") \
-        .select("*") \
-        .eq("user_id", user_id) \
-        .execute()
-
-    access_token = token_res.data[0]["zoho_access_token"]
-
-    fields = get_zoho_fields(access_token, module)
-
-    # show fields as checkboxes
-    fields_html = ""
-    for f in fields:
-        required_tag = " (Required)" if f["required"] else ""
-        fields_html += f"""
-        <input type="checkbox" name="fields" value="{f['api_name']}">
-        {f['display_label']}{required_tag}<br>
-        """
-
-    return f"""
-    <h2>Select Fields → {module}</h2>
-
-    <form action="/field-input" method="post">
-        <input type="hidden" name="user_id" value="{user_id}">
-        <input type="hidden" name="module" value="{module}">
-
-        {fields_html}
-
-        <br><br>
+        <select name="module">{options}</select><br><br>
         <button type="submit">Next</button>
     </form>
     """
 
+# =========================
+# FIELD SELECT
+# =========================
+@app.get("/push-select", response_class=HTMLResponse)
+def push_select(user_id: str, module: str):
+
+    token = get_valid_token(user_id)   # ✅ FIXED
+
+    if not token:
+        return "Zoho not connected"
+
+    fields = get_fields(token, module)
+
+    html = ""
+    for f in fields:
+        html += f"""
+        <input type="checkbox" name="fields" value="{f['api_name']}">
+        {f['field_label']}<br>
+        """
+
+    return f"""
+    <form action="/field-input" method="post">
+        <input type="hidden" name="user_id" value="{user_id}">
+        <input type="hidden" name="module" value="{module}">
+        {html}
+        <button type="submit">Next</button>
+    </form>
+    """
+# =========================
+# FIELD INPUT
+# =========================
 @app.post("/field-input", response_class=HTMLResponse)
 async def field_input(request: Request):
 
@@ -290,9 +283,9 @@ async def field_input(request: Request):
 
     user_id = form.get("user_id")
     module = form.get("module")
-    selected_fields = form.getlist("fields")
+    fields = form.getlist("fields")
 
-    # fetch row list
+    # 🔹 Fetch data from Supabase
     res = supabase.table("answers") \
         .select("id, answer, questions(question_text)") \
         .eq("user_id", user_id) \
@@ -300,19 +293,39 @@ async def field_input(request: Request):
 
     rows = res.data
 
+    if not rows:
+        return "<h3>No data found for this user</h3>"
+
+    # 🔹 Build checkbox list + table
     row_options = ""
+    table_rows = ""
+
     for r in rows:
         q = r.get("questions", {}).get("question_text", "")
-        row_options += f'<option value="{r["id"]}">{r["id"]} - {q}</option>'
+        a = r.get("answer", "")
 
-    # generate inputs
-    inputs_html = ""
-    for f in selected_fields:
-        inputs_html += f"""
-        <label>{f}</label><br>
-        <input name="value_{f}"><br><br>
+        row_options += f"""
+        <input type="checkbox" name="row_ids" value="{r["id"]}">
+        <b>{r["id"]}</b> - {q}<br>
         """
 
+        table_rows += f"""
+        <tr>
+            <td>{r["id"]}</td>
+            <td>{q}</td>
+            <td>{a}</td>
+        </tr>
+        """
+
+    # 🔹 Build input fields
+    inputs = ""
+    for f in fields:
+        inputs += f"""
+        <label><b>{f}</b></label><br>
+        <input name="val_{f}" placeholder="Enter {f}"><br><br>
+        """
+
+    # 🔥 FINAL HTML
     return f"""
     <h2>Enter Field Values → {module}</h2>
 
@@ -320,86 +333,104 @@ async def field_input(request: Request):
         <input type="hidden" name="user_id" value="{user_id}">
         <input type="hidden" name="module" value="{module}">
 
-        {''.join([f'<input type="hidden" name="fields" value="{f}">' for f in selected_fields])}
+        {''.join([f"<input type='hidden' name='fields' value='{f}'>" for f in fields])}
 
-        {inputs_html}
+        <h3>Enter Values</h3>
+        {inputs}
 
-        <h3>Select Row ID (for Q&A context)</h3>
-        <select name="row_id">
-            {row_options}
-        </select>
+        <h3>Select Rows (Multiple Allowed)</h3>
+        {row_options}
 
         <br><br>
         <button type="submit">Push</button>
     </form>
+
+    <hr>
+
+    <h3>Your Data Preview</h3>
+    <table border="1" cellpadding="5">
+        <tr>
+            <th>ID</th>
+            <th>Question</th>
+            <th>Answer</th>
+        </tr>
+        {table_rows}
+    </table>
     """
 # =========================
-# PUSH DATA
+# PUSH
 # =========================
 @app.post("/push")
-async def push_to_zoho(request: Request):
+async def push(request: Request):
 
     form = await request.form()
 
     user_id = form.get("user_id")
     module = form.get("module")
-    selected_fields = form.getlist("fields")
-    row_id = form.get("row_id")
+    fields = form.getlist("fields")
+    row_ids = form.getlist("row_ids")
 
-    # 🔹 Get token
-    token_res = supabase.table("zoho_tokens") \
-        .select("*") \
-        .eq("user_id", user_id) \
-        .execute()
+    if not row_ids:
+        return {"error": "No rows selected"}
 
-    access_token = token_res.data[0]["zoho_access_token"]
+    token = get_valid_token(user_id)
 
-    # 🔹 Build field data
-    zoho_data = {}
+    if not token:
+        return {"error": "Zoho not connected"}
 
-    for f in selected_fields:
-        value = form.get(f"value_{f}")
-        if value:
-            zoho_data[f] = value
+    data_list = []
 
-    # 🔹 Fetch row context
-    row_res = supabase.table("answers") \
-        .select("answer, follow_up_question, questions(question_text)") \
-        .eq("id", int(row_id)) \
-        .execute()
+    for row_id in row_ids:
 
-    if row_res.data:
+        try:
+            row_id_int = int(row_id)
+        except:
+            continue
+
+        row_res = supabase.table("answers") \
+            .select("answer, follow_up_question, questions(question_text)") \
+            .eq("id", row_id_int) \
+            .execute()
+
+        if not row_res.data:
+            continue
+
         row = row_res.data[0]
+
         description = f"""
         Question: {row.get('questions', {}).get('question_text', '')}
         Answer: {row.get('answer', '')}
         Follow Up: {row.get('follow_up_question', '')}
         """
 
-        zoho_data["Description"] = description
+        record = {}
 
-    # 🔹 Push
-    payload = {"data": [zoho_data]}
+        for f in fields:
+            val = form.get(f"val_{f}")
+            if val:
+                record[f] = val
+
+        record["Description"] = description
+
+        data_list.append(record)
+
+    if not data_list:
+        return {"error": "No valid rows found"}
 
     url = f"https://www.zohoapis.in/crm/v2/{module}"
+
     headers = {
-        "Authorization": f"Zoho-oauthtoken {access_token}"
+        "Authorization": f"Zoho-oauthtoken {token}"
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json={"data": data_list}, headers=headers)
+
+    # 🔥 Safe update
+    supabase.table("zoho_tokens").update({
+        "modified_at": datetime.utcnow().isoformat()
+    }).eq("user_id", user_id).execute()
 
     return {
-        "module": module,
-        "data_sent": zoho_data,
+        "records_sent": len(data_list),
         "zoho_response": response.json()
     }
-# =========================
-# AUTO OPEN
-# =========================
-def open_browser():
-    webbrowser.open("http://127.0.0.1:8000")
-
-if __name__ == "__main__":
-    import uvicorn
-    threading.Timer(1.5, open_browser).start()
-    uvicorn.run(app, host="127.0.0.1", port=8000)
