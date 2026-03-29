@@ -107,7 +107,7 @@ def do_refresh_token(user_id: str, refresh_token: str):
 # =========================
 from fastapi import Form
 
-@app.post("/auth/token")
+@app.post("/crm/zoho/auth/token")
 def get_token(email: str = Form(...), password: str = Form(...)):
     res = supabase.auth.sign_in_with_password({
         "email": email,
@@ -198,45 +198,114 @@ def disconnect(user=Depends(get_current_user)):
 # Fetches Leads, Deals, Contacts from Zoho.
 # Optional ?search=term filters by name.
 # =========================
-@app.get("/crm/zoho/records/list")
-def list_records(request: Request, user=Depends(get_current_user)):
-    token = get_valid_token(user.id)
-    if not token:
-        raise HTTPException(status_code=401, detail="Zoho not connected or token refresh failed")
+from typing import Optional
 
-    search = request.query_params.get("search")
+# =========================
+# HELPER — PAGINATION
+# =========================
+def fetch_all_records(module, headers):
+    all_data = []
+    page = 1
+
+    while True:
+        res = requests.get(
+            f"{ZOHO_API_BASE}/{module}",
+            headers=headers,
+            params={"page": page, "per_page": 200}
+        )
+
+        if res.status_code == 204:
+            break
+
+        if res.status_code != 200:
+            print(f"Error in {module}: ", res.text)
+            break
+
+        data = res.json().get("data", [])
+
+        if not data:
+            break
+
+        all_data.extend(data)
+
+        if len(data) < 200:
+            break
+
+        page += 1
+
+    return all_data
+
+
+# =========================
+# MAIN ENDPOINT
+# =========================
+@app.get("/crm/zoho/records/list")
+def list_records(
+    search: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    token = get_valid_token(user.id)
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Zoho not connected")
+
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
 
-    # (Zoho module name, unified type, name field in Zoho response)
     modules = [
-        ("Leads",    "lead",        "Full_Name"),
-        ("Deals",    "opportunity", "Deal_Name"),
-        ("Contacts", "contact",     "Full_Name"),
+        ("Leads", "lead", "Full_Name"),
+        ("Deals", "opportunity", "Deal_Name"),
+        ("Contacts", "contact", "Full_Name"),
     ]
 
     results = []
 
     for module, record_type, name_field in modules:
-        if search:
-            url = f"{ZOHO_API_BASE}/{module}/search"
-            res = requests.get(url, params={"criteria": f"({name_field}:contains:{search})"}, headers=headers)
+
+        # =========================
+        # SEARCH MODE
+        # =========================
+        if search and len(search) >= 3:
+            res = requests.get(
+                f"{ZOHO_API_BASE}/{module}/search",
+                headers=headers,
+                params={"criteria": f"({name_field}:contains:{search})"}
+            )
+
+            if res.status_code != 200:
+                print(f"Search error {module}: ", res.text)
+                continue
+
+            data = res.json().get("data", [])
+
+        # =========================
+        # FETCH ALL MODE
+        # =========================
         else:
-            res = requests.get(f"{ZOHO_API_BASE}/{module}", headers=headers)
+            data = fetch_all_records(module, headers)
 
-        if res.status_code == 204:  # no records in this module
-            continue
-        if res.status_code != 200:
-            continue
+            # Local filtering for short search
+            if search:
+                search_lower = search.lower()
+                data = [
+                    r for r in data
+                    if search_lower in str(r.get(name_field, "")).lower()
+                ]
 
-        for r in res.json().get("data", []):
+        # =========================
+        # FORMAT OUTPUT
+        # =========================
+        for r in data:
             results.append({
                 "id": r.get("id"),
                 "name": r.get(name_field, ""),
                 "type": record_type,
             })
 
-    return {"success": True, "data": results}
-
+    return {
+        "success": True,
+        "count": len(results),
+        "data": results
+    }
 # =========================
 # RECORDS — MAP
 # Links a Convverse opportunity_id to a Zoho crm_record_id.
@@ -252,6 +321,7 @@ class MapRecordRequest(BaseModel):
 
 class PushRequest(BaseModel):
     opportunity_id: str
+    user_id: str
 
 
 @app.post("/crm/zoho/records/map")
@@ -271,7 +341,7 @@ def map_record(body: MapRecordRequest, user=Depends(get_current_user)):
 @app.post("/crm/zoho/sync/push")
 def push(body: PushRequest, user=Depends(get_current_user)):
     opportunity_id = body.opportunity_id
-
+    user_id = body.user_id
     # 1. Get valid token
     token = get_valid_token(user.id)
     if not token:
